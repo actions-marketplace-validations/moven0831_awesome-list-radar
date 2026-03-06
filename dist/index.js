@@ -46083,11 +46083,19 @@ const WebPagesSourceSchema = zod_1.z.object({
     request_timeout: zod_1.z.number().int().min(1000).max(120000).default(30000),
     user_agent: zod_1.z.string().optional(),
 });
+const RegistryEntrySchema = zod_1.z.object({
+    type: zod_1.z.enum(["npm", "pypi", "crates"]),
+    keywords: zod_1.z.array(zod_1.z.string()).min(1),
+    min_downloads: zod_1.z.number().int().nonnegative().default(0),
+    max_results: zod_1.z.number().int().min(1).max(250).default(50),
+});
+const RegistrySourceSchema = zod_1.z.array(RegistryEntrySchema).min(1);
 const SourcesSchema = zod_1.z.object({
     github: GithubSourceSchema.optional(),
     arxiv: ArxivSourceSchema.optional(),
     blogs: BlogsSourceSchema.optional(),
     web_pages: WebPagesSourceSchema.optional(),
+    registries: RegistrySourceSchema.optional(),
 });
 const FilterSchema = zod_1.z
     .object({
@@ -46123,7 +46131,7 @@ const IssueTemplateSchema = zod_1.z.object({
 exports.RadarConfigSchema = zod_1.z.object({
     description: zod_1.z.string().min(1),
     list_file: zod_1.z.string().default("README.md"),
-    sources: SourcesSchema.refine((s) => s.github || s.arxiv || s.blogs || s.web_pages, "At least one source must be configured"),
+    sources: SourcesSchema.refine((s) => s.github || s.arxiv || s.blogs || s.web_pages || s.registries, "At least one source must be configured"),
     filter: FilterSchema,
     classification: ClassificationSchema.default({}),
     issue_template: IssueTemplateSchema.default({}),
@@ -46463,6 +46471,7 @@ const github_1 = __nccwpck_require__(15);
 const arxiv_1 = __nccwpck_require__(5012);
 const blogs_1 = __nccwpck_require__(4731);
 const web_pages_1 = __nccwpck_require__(8555);
+const registry_1 = __nccwpck_require__(2667);
 const keywords_1 = __nccwpck_require__(9216);
 const metadata_1 = __nccwpck_require__(445);
 const dedup_1 = __nccwpck_require__(6962);
@@ -46481,6 +46490,9 @@ async function collect(config) {
     }
     if (config.sources.web_pages) {
         candidates.push(...(await (0, web_pages_1.collectWebPages)(config)));
+    }
+    if (config.sources.registries) {
+        candidates.push(...(await (0, registry_1.collectRegistries)(config)));
     }
     return candidates;
 }
@@ -47131,6 +47143,170 @@ async function collectGitHub(config, octokit) {
     }
     catch (error) {
         core.warning(`GitHub search failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return candidates;
+}
+
+
+/***/ }),
+
+/***/ 2667:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.collectRegistries = collectRegistries;
+const core = __importStar(__nccwpck_require__(7484));
+async function collectNpm(entry, fetchFn) {
+    const candidates = [];
+    const query = entry.keywords.join(" ");
+    const url = `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(query)}&size=${entry.max_results}`;
+    const response = await fetchFn(url);
+    if (!response.ok) {
+        core.warning(`npm search failed: HTTP ${response.status}`);
+        return [];
+    }
+    if (entry.min_downloads > 0) {
+        core.warning(`min_downloads is not supported for npm (search API lacks download counts) and will be ignored`);
+    }
+    const data = (await response.json());
+    for (const result of data.objects ?? []) {
+        const pkg = result.package;
+        candidates.push({
+            url: `https://www.npmjs.com/package/${pkg.name}`,
+            title: pkg.name,
+            description: (pkg.description ?? "").slice(0, 1000),
+            source: "registry",
+            metadata: {
+                language: "JavaScript",
+                publishedAt: pkg.date,
+            },
+        });
+    }
+    return candidates;
+}
+async function collectPyPI(entry, fetchFn) {
+    const candidates = [];
+    if (entry.min_downloads > 0) {
+        core.warning(`min_downloads is not supported for PyPI and will be ignored`);
+    }
+    for (const keyword of entry.keywords) {
+        const url = `https://pypi.org/pypi/${encodeURIComponent(keyword)}/json`;
+        try {
+            const response = await fetchFn(url);
+            if (!response.ok)
+                continue;
+            const data = (await response.json());
+            const info = data.info;
+            if (!info)
+                continue;
+            candidates.push({
+                url: `https://pypi.org/project/${info.name}/`,
+                title: info.name,
+                description: (info.summary ?? "").slice(0, 1000),
+                source: "registry",
+                metadata: {
+                    language: "Python",
+                    publishedAt: data.urls?.[0]?.upload_time_iso_8601,
+                },
+            });
+        }
+        catch {
+            core.warning(`PyPI lookup failed for "${keyword}"`);
+        }
+    }
+    return candidates;
+}
+async function collectCrates(entry, fetchFn) {
+    const candidates = [];
+    const query = entry.keywords.join(" ");
+    const url = `https://crates.io/api/v1/crates?q=${encodeURIComponent(query)}&per_page=${entry.max_results}&sort=downloads`;
+    const response = await fetchFn(url, {
+        headers: {
+            "User-Agent": "awesome-list-radar (https://github.com/moven0831/awesome-list-radar)",
+        },
+    });
+    if (!response.ok) {
+        core.warning(`crates.io search failed: HTTP ${response.status}`);
+        return [];
+    }
+    const data = (await response.json());
+    for (const crate of data.crates ?? []) {
+        if (entry.min_downloads > 0 &&
+            (crate.downloads ?? 0) < entry.min_downloads) {
+            continue;
+        }
+        candidates.push({
+            url: `https://crates.io/crates/${crate.name}`,
+            title: crate.name,
+            description: (crate.description ?? "").slice(0, 1000),
+            source: "registry",
+            metadata: {
+                language: "Rust",
+                publishedAt: crate.updated_at,
+            },
+        });
+    }
+    return candidates;
+}
+async function collectRegistries(config, fetchFn = fetch) {
+    if (!config.sources.registries)
+        return [];
+    const candidates = [];
+    for (const entry of config.sources.registries) {
+        try {
+            let results;
+            switch (entry.type) {
+                case "npm":
+                    results = await collectNpm(entry, fetchFn);
+                    break;
+                case "pypi":
+                    results = await collectPyPI(entry, fetchFn);
+                    break;
+                case "crates":
+                    results = await collectCrates(entry, fetchFn);
+                    break;
+            }
+            core.info(`Registry ${entry.type}: found ${results.length} candidates`);
+            candidates.push(...results);
+        }
+        catch (error) {
+            core.warning(`Registry ${entry.type} collection failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
     }
     return candidates;
 }
