@@ -46131,6 +46131,7 @@ const IssueTemplateSchema = zod_1.z.object({
 exports.RadarConfigSchema = zod_1.z.object({
     description: zod_1.z.string().min(1),
     list_file: zod_1.z.string().default("README.md"),
+    state_file: zod_1.z.string().default(".radar-state.json"),
     sources: SourcesSchema.refine((s) => s.github || s.arxiv || s.blogs || s.web_pages || s.registries, "At least one source must be configured"),
     filter: FilterSchema,
     classification: ClassificationSchema.default({}),
@@ -46477,6 +46478,7 @@ const metadata_1 = __nccwpck_require__(445);
 const dedup_1 = __nccwpck_require__(6962);
 const llm_1 = __nccwpck_require__(5178);
 const issues_1 = __nccwpck_require__(3597);
+const state_1 = __nccwpck_require__(2462);
 async function collect(config) {
     const candidates = [];
     if (config.sources.github) {
@@ -46496,23 +46498,51 @@ async function collect(config) {
     }
     return candidates;
 }
-async function filter(candidates, config) {
-    const keywordFiltered = (0, keywords_1.filterCandidates)(candidates, config);
-    const metadataFiltered = (0, metadata_1.filterByMetadata)(keywordFiltered, config);
-    return (0, dedup_1.dedup)(metadataFiltered, config);
-}
 async function run() {
     try {
         const configPath = core.getInput("config_path");
         const dryRun = core.getInput("dry_run") === "true";
         core.info(`Loading config from ${configPath}`);
         const config = (0, config_1.loadConfig)(configPath);
-        const result = await (0, pipeline_1.runPipeline)(config, {
-            collect,
-            filter,
-            classify: llm_1.classifyCandidates,
-            output: issues_1.createIssues,
-        }, dryRun);
+        // Load state
+        const state = (0, state_1.loadState)(config.state_file);
+        let result;
+        try {
+            result = await (0, pipeline_1.runPipeline)(config, {
+                collect,
+                filter: async (candidates, cfg) => {
+                    // First filter out already-seen candidates
+                    const unseen = (0, state_1.filterSeenCandidates)(candidates, state);
+                    // Then apply keyword filtering, metadata filtering, and dedup
+                    const keywordFiltered = (0, keywords_1.filterCandidates)(unseen, cfg);
+                    const metadataFiltered = (0, metadata_1.filterByMetadata)(keywordFiltered, cfg);
+                    const metadataResult = (0, dedup_1.dedup)(metadataFiltered, cfg);
+                    // Record candidates that were filtered out
+                    const filteredOut = unseen.filter((c) => !metadataResult.includes(c));
+                    (0, state_1.recordCandidates)(state, filteredOut, "filtered");
+                    return metadataResult;
+                },
+                classify: async (candidates, cfg) => {
+                    const classified = await (0, llm_1.classifyCandidates)(candidates, cfg);
+                    // Record accepted (classified) and rejected (below threshold) candidates
+                    const classifiedUrls = new Set(classified.map((c) => c.url));
+                    const rejected = candidates.filter((c) => !classifiedUrls.has(c.url));
+                    (0, state_1.recordCandidates)(state, classified, "accepted");
+                    (0, state_1.recordCandidates)(state, rejected, "rejected");
+                    return classified;
+                },
+                output: issues_1.createIssues,
+            }, dryRun);
+        }
+        finally {
+            // Save state regardless of pipeline success/failure
+            try {
+                (0, state_1.saveState)(config.state_file, state);
+            }
+            catch (saveError) {
+                core.warning(`Failed to save state: ${saveError instanceof Error ? saveError.message : String(saveError)}`);
+            }
+        }
         core.setOutput("candidates_found", result.candidatesFound);
         core.setOutput("candidates_filtered", result.candidatesFiltered);
         core.setOutput("issues_created", result.issuesCreated);
@@ -47499,6 +47529,113 @@ async function collectWebPages(config, fetchFn, client) {
         }
     }
     return candidates;
+}
+
+
+/***/ }),
+
+/***/ 2462:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.loadState = loadState;
+exports.saveState = saveState;
+exports.filterSeenCandidates = filterSeenCandidates;
+exports.recordCandidates = recordCandidates;
+exports.updateWatermark = updateWatermark;
+const node_fs_1 = __nccwpck_require__(3024);
+const core = __importStar(__nccwpck_require__(7484));
+const EMPTY_STATE = {
+    seen_urls: {},
+    watermarks: {},
+};
+function loadState(filePath) {
+    let content;
+    try {
+        content = (0, node_fs_1.readFileSync)(filePath, "utf-8");
+    }
+    catch {
+        core.info(`No existing state file at "${filePath}", starting fresh`);
+        return { seen_urls: {}, watermarks: {} };
+    }
+    try {
+        const parsed = JSON.parse(content);
+        if (typeof parsed === "object" &&
+            parsed !== null &&
+            typeof parsed.seen_urls === "object") {
+            return {
+                seen_urls: parsed.seen_urls ?? {},
+                watermarks: parsed.watermarks ?? {},
+            };
+        }
+        core.warning(`Invalid state file structure at "${filePath}", starting fresh`);
+    }
+    catch {
+        core.warning(`Corrupt state file at "${filePath}" (invalid JSON), starting fresh`);
+    }
+    return { seen_urls: {}, watermarks: {} };
+}
+function saveState(filePath, state) {
+    (0, node_fs_1.writeFileSync)(filePath, JSON.stringify(state, null, 2), "utf-8");
+    core.info(`State saved to "${filePath}" (${Object.keys(state.seen_urls).length} URLs tracked)`);
+}
+function filterSeenCandidates(candidates, state) {
+    const before = candidates.length;
+    const filtered = candidates.filter((c) => {
+        const normalized = c.url.toLowerCase();
+        return !state.seen_urls[normalized];
+    });
+    if (before !== filtered.length) {
+        core.info(`State filter: ${before} → ${filtered.length} candidates (${before - filtered.length} already seen)`);
+    }
+    return filtered;
+}
+function recordCandidates(state, candidates, status) {
+    const now = new Date().toISOString();
+    for (const c of candidates) {
+        state.seen_urls[c.url.toLowerCase()] = { status, seen_at: now };
+    }
+}
+function updateWatermark(state, sourceKey, lastResultId) {
+    state.watermarks[sourceKey] = {
+        last_run: new Date().toISOString(),
+        last_result_id: lastResultId,
+    };
 }
 
 
