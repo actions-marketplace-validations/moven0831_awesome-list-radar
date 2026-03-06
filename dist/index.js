@@ -45824,7 +45824,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.SYSTEM_PROMPT = void 0;
+exports.SYSTEM_PROMPT = exports.MODEL_PRICING = void 0;
+exports.estimateCost = estimateCost;
 exports.classifyCandidates = classifyCandidates;
 exports.buildUserPrompt = buildUserPrompt;
 exports.parseClassifyResponse = parseClassifyResponse;
@@ -45928,6 +45929,19 @@ function parseClassifyResponse(text) {
         reasoning: String(parsed.reasoning ?? ""),
     };
 }
+exports.MODEL_PRICING = {
+    "claude-sonnet-4-6": { inputPer1M: 3.0, outputPer1M: 15.0 },
+    "claude-haiku-4-5-20251001": { inputPer1M: 0.8, outputPer1M: 4.0 },
+    "claude-opus-4-6": { inputPer1M: 15.0, outputPer1M: 75.0 },
+};
+function estimateCost(inputTokens, outputTokens, model) {
+    const pricing = exports.MODEL_PRICING[model];
+    if (!pricing) {
+        core.warning(`No pricing found for model "${model}"; falling back to claude-sonnet-4-6 pricing. Cost estimates may be inaccurate.`);
+    }
+    const effectivePricing = pricing ?? exports.MODEL_PRICING["claude-sonnet-4-6"];
+    return (inputTokens * effectivePricing.inputPer1M + outputTokens * effectivePricing.outputPer1M) / 1_000_000;
+}
 // Caps the number of LLM API calls per run. Candidates beyond this
 // limit are not classified. This controls API cost, not the final
 // number of issues created (which may be lower after threshold filtering).
@@ -45935,10 +45949,19 @@ async function classifyCandidates(candidates, config, client) {
     if (candidates.length === 0)
         return [];
     const anthropic = client ?? new sdk_1.default({ apiKey: core.getInput("anthropic_api_key") });
-    const maxClassifications = config.classification.max_issues_per_run;
+    const maxClassifications = config.classification.max_classifications_per_run;
+    const maxBudget = config.classification.max_budget_usd;
     const toClassify = candidates.slice(0, maxClassifications);
     const classified = [];
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalCost = 0;
     for (const candidate of toClassify) {
+        // Budget check before each call
+        if (maxBudget !== undefined && totalCost >= maxBudget) {
+            core.warning(`Budget limit reached ($${totalCost.toFixed(4)} >= $${maxBudget}). Skipping remaining ${toClassify.length - classified.length} candidates.`);
+            break;
+        }
         try {
             const message = await (0, retry_1.withRetry)(() => anthropic.messages.create({
                 model: config.classification.model,
@@ -45948,6 +45971,14 @@ async function classifyCandidates(candidates, config, client) {
                     { role: "user", content: buildUserPrompt(candidate, config) },
                 ],
             }));
+            // Track token usage
+            const inputTokens = message.usage?.input_tokens ?? 0;
+            const outputTokens = message.usage?.output_tokens ?? 0;
+            const cost = estimateCost(inputTokens, outputTokens, config.classification.model);
+            totalInputTokens += inputTokens;
+            totalOutputTokens += outputTokens;
+            totalCost += cost;
+            core.info(`Classification "${candidate.title}": ${inputTokens} in / ${outputTokens} out tokens ($${cost.toFixed(4)})`);
             const text = message.content[0].type === "text" ? message.content[0].text : "";
             const result = parseClassifyResponse(text);
             if (result.relevanceScore >= config.classification.threshold) {
@@ -45961,6 +45992,8 @@ async function classifyCandidates(candidates, config, client) {
             core.warning(`Classification failed for "${candidate.title}": ${error instanceof Error ? error.message : String(error)}`);
         }
     }
+    // Log summary
+    core.info(`Classification summary: ${totalInputTokens} input tokens, ${totalOutputTokens} output tokens, estimated cost: $${totalCost.toFixed(4)}`);
     return classified;
 }
 
@@ -46031,8 +46064,13 @@ const SourcesSchema = zod_1.z.object({
 const ClassificationSchema = zod_1.z.object({
     model: zod_1.z.string().default("claude-sonnet-4-6"),
     threshold: zod_1.z.number().min(0).max(100).default(70),
-    max_issues_per_run: zod_1.z.number().int().positive().default(5),
-});
+    max_classifications_per_run: zod_1.z.number().int().positive().optional(),
+    max_issues_per_run: zod_1.z.number().int().positive().optional(), // deprecated alias
+    max_budget_usd: zod_1.z.number().positive().optional(),
+}).transform((val) => ({
+    ...val,
+    max_classifications_per_run: val.max_classifications_per_run ?? val.max_issues_per_run ?? 5,
+}));
 const IssueTemplateSchema = zod_1.z.object({
     labels: zod_1.z.array(zod_1.z.string()).default(["radar", "needs-review"]),
 });
