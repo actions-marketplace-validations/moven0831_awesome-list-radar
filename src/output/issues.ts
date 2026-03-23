@@ -3,6 +3,7 @@ import * as github from "@actions/github";
 import type { RadarConfig } from "../config";
 import type { ClassifiedCandidate } from "../sources/types";
 import { withRetry } from "../utils/retry";
+import { normalizeUrl } from "../filter/dedup";
 
 function escapeTableCell(value: string): string {
   return value.replace(/\|/g, "\\|").replace(/\n/g, " ");
@@ -134,20 +135,33 @@ function makeGitHubClient(token: string): IssueClient {
 
   return {
     async listIssues(labels: string[]) {
-      // Note: fetches up to 100 open issues. Repos with >100 open radar
-      // issues may see duplicate issue creation. Use GitHub search API
-      // for more robust dedup if this becomes an issue.
-      const { data } = await octokit.rest.issues.listForRepo({
-        owner,
-        repo,
-        state: "open",
-        labels: labels.join(","),
-        per_page: 100,
-      });
-      return data.map((i) => ({
-        title: i.title,
-        body: i.body ?? undefined,
-      }));
+      const allIssues: { title: string; body?: string }[] = [];
+      let page = 1;
+      const perPage = 100;
+
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { data } = await octokit.rest.issues.listForRepo({
+          owner,
+          repo,
+          state: "all",
+          labels: labels.join(","),
+          per_page: perPage,
+          page,
+        });
+
+        for (const i of data) {
+          allIssues.push({ title: i.title, body: i.body ?? undefined });
+        }
+
+        if (data.length < perPage) break;
+        page++;
+      }
+
+      core.info(
+        `Fetched ${allIssues.length} existing issues (open+closed) for dedup`
+      );
+      return allIssues;
     },
 
     async createIssue(title: string, body: string, labels: string[]) {
@@ -191,15 +205,15 @@ export async function createIssues(
         const match = issue.body?.match(
           /\| \*\*URL\*\* \| (https?:\/\/[^\s|]+)/
         );
-        return match?.[1]?.toLowerCase();
+        return match?.[1] ? normalizeUrl(match[1]) : undefined;
       })
-      .filter(Boolean)
+      .filter((url): url is string => url !== undefined)
   );
 
   let created = 0;
 
   for (const candidate of candidates) {
-    if (existingUrls.has(candidate.url.toLowerCase())) {
+    if (existingUrls.has(normalizeUrl(candidate.url))) {
       core.info(
         `Skipping "${candidate.title}" — issue already exists for ${candidate.url}`
       );

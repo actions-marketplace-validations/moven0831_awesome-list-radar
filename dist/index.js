@@ -46608,6 +46608,7 @@ exports.renderTemplate = renderTemplate;
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 const retry_1 = __nccwpck_require__(5931);
+const dedup_1 = __nccwpck_require__(6962);
 function escapeTableCell(value) {
     return value.replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
@@ -46680,20 +46681,28 @@ function makeGitHubClient(token) {
     const { owner, repo } = github.context.repo;
     return {
         async listIssues(labels) {
-            // Note: fetches up to 100 open issues. Repos with >100 open radar
-            // issues may see duplicate issue creation. Use GitHub search API
-            // for more robust dedup if this becomes an issue.
-            const { data } = await octokit.rest.issues.listForRepo({
-                owner,
-                repo,
-                state: "open",
-                labels: labels.join(","),
-                per_page: 100,
-            });
-            return data.map((i) => ({
-                title: i.title,
-                body: i.body ?? undefined,
-            }));
+            const allIssues = [];
+            let page = 1;
+            const perPage = 100;
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                const { data } = await octokit.rest.issues.listForRepo({
+                    owner,
+                    repo,
+                    state: "all",
+                    labels: labels.join(","),
+                    per_page: perPage,
+                    page,
+                });
+                for (const i of data) {
+                    allIssues.push({ title: i.title, body: i.body ?? undefined });
+                }
+                if (data.length < perPage)
+                    break;
+                page++;
+            }
+            core.info(`Fetched ${allIssues.length} existing issues (open+closed) for dedup`);
+            return allIssues;
         },
         async createIssue(title, body, labels) {
             const { data } = await octokit.rest.issues.create({
@@ -46723,12 +46732,12 @@ async function createIssues(candidates, config, dryRun, client) {
     const existingUrls = new Set(existingIssues
         .map((issue) => {
         const match = issue.body?.match(/\| \*\*URL\*\* \| (https?:\/\/[^\s|]+)/);
-        return match?.[1]?.toLowerCase();
+        return match?.[1] ? (0, dedup_1.normalizeUrl)(match[1]) : undefined;
     })
-        .filter(Boolean));
+        .filter((url) => url !== undefined));
     let created = 0;
     for (const candidate of candidates) {
-        if (existingUrls.has(candidate.url.toLowerCase())) {
+        if (existingUrls.has((0, dedup_1.normalizeUrl)(candidate.url))) {
             core.info(`Skipping "${candidate.title}" — issue already exists for ${candidate.url}`);
             continue;
         }

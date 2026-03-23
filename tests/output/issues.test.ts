@@ -238,12 +238,12 @@ describe("createIssues", () => {
     expect(client.createIssue).not.toHaveBeenCalled();
   });
 
-  it("idempotency check is case-insensitive", async () => {
+  it("idempotency check is case-insensitive and normalized", async () => {
     const client = mockClient();
     client.listIssues.mockResolvedValue([
       {
         title: "[Radar] test/repo",
-        body: "| **URL** | https://GitHub.com/Test/Repo |",
+        body: "| **URL** | http://www.GitHub.com/Test/Repo/ |",
       },
     ]);
 
@@ -298,5 +298,39 @@ describe("createIssues", () => {
 
     expect(count).toBe(1);
     expect(client.createIssue).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips candidates matching closed issue URLs", async () => {
+    const client = mockClient();
+    client.listIssues.mockResolvedValue([
+      {
+        title: "[Radar] previously-rejected/repo",
+        body: "| **URL** | https://github.com/test/repo |",
+      },
+    ]);
+
+    const count = await createIssues([mockClassified], baseConfig, false, client);
+
+    expect(count).toBe(0);
+    expect(client.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("dedup normalizes URLs (protocol, www, trailing slash)", async () => {
+    const client = mockClient();
+    client.listIssues.mockResolvedValue([
+      {
+        title: "[Radar] some repo",
+        body: "| **URL** | https://www.github.com/test/repo/ |",
+      },
+    ]);
+
+    const candidate = {
+      ...mockClassified,
+      url: "https://github.com/test/repo",
+    };
+    const count = await createIssues([candidate], baseConfig, false, client);
+
+    expect(count).toBe(0);
+    expect(client.createIssue).not.toHaveBeenCalled();
   });
 });
